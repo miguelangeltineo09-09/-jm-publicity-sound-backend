@@ -15,14 +15,27 @@ import { FacturaNoEncontradaError, formatearFechaUTC, generarPDFFactura } from "
 const TELEFONO_NEGOCIO = "+52 55 0000 0000";
 const EMAIL_NEGOCIO = "contacto@jmpublicitysound.com";
 
-// Remitente del correo. IMPORTANTE: en el plan gratis de Resend, mientras
-// no se verifique un dominio propio (https://resend.com/domains), solo se
-// puede enviar desde la dirección de prueba de Resend
-// ("onboarding@resend.dev"), y ÚNICAMENTE al correo con el que te
-// registraste en Resend — cualquier otro destinatario será rechazado. Se
-// deja configurable por variable de entorno para no tocar código el día
-// que se verifique un dominio propio (ver .env.example).
-const REMITENTE = process.env.RESEND_FROM_EMAIL || "JM Publicity Sound <onboarding@resend.dev>";
+// Remitente del correo. El dominio jmpublicitysound.com YA está verificado
+// en Resend (Settings > Domains), así que las facturas se envían desde una
+// dirección propia de ese dominio en vez de la dirección de prueba de
+// Resend ("onboarding@resend.dev") — esa dirección de prueba solo dejaba
+// mandar al correo con el que te registraste en Resend, algo que ya no
+// aplica ahora que hay un dominio propio verificado: se puede enviar a
+// cualquier destinatario real.
+//
+// "facturas@jmpublicitysound.com" NO necesita ser una casilla real que
+// alguien revise (no hace falta crearla en ningún proveedor de correo):
+// Resend solo exige que el DOMINIO esté verificado vía DNS para poder
+// enviar DESDE cualquier dirección de ese dominio, exista o no esa
+// casilla puntual — es análogo a cómo un dominio puede tener
+// "no-reply@" o "notificaciones@" sin que nadie lea esas bandejas.
+//
+// Sigue siendo configurable por variable de entorno (RESEND_FROM_EMAIL,
+// ver .env.example) en vez de quedar fija en el código: así, si el
+// negocio cambia de dirección de remitente en el futuro (ej.
+// "reservas@jmpublicitysound.com"), alcanza con cambiar la variable de
+// entorno, sin tocar código ni volver a desplegar.
+const REMITENTE = process.env.RESEND_FROM_EMAIL || "JM Publicity Sound <facturas@jmpublicitysound.com>";
 
 // Error propio para el envío de correo, análogo a los de factura.service.ts:
 // el mensaje ya viene "limpio" (sin detalles internos de la API de Resend),
@@ -47,14 +60,18 @@ export class EmailNoRegistradoError extends Error {}
 function mensajeDeErrorResend(errorResend: { name: string; message: string }): string {
   const { name: nombreError, message: mensajeOriginal } = errorResend;
 
-  // Caso puntual y muy común mientras no haya un dominio verificado (ver
-  // el aviso en .env.example): Resend NO usa un código de error propio
-  // para "destinatario no permitido" — lo reporta como "validation_error"
-  // genérico. Se detecta por el texto del mensaje para poder avisar la
-  // causa real (en vez de un genérico "datos inválidos") sin repetir el
-  // texto interno de Resend tal cual.
+  // Caso puntual que ya NO debería ocurrir en operación normal ahora que
+  // el dominio jmpublicitysound.com está verificado (ver el comentario de
+  // REMITENTE más arriba), pero se conserva por si algún día se vuelve a
+  // mandar sin querer desde la dirección de prueba de Resend
+  // ("onboarding@resend.dev", ej. si RESEND_FROM_EMAIL quedara mal
+  // configurado en el entorno): Resend NO usa un código de error propio
+  // para "destinatario no permitido" en ese caso — lo reporta como
+  // "validation_error" genérico. Se detecta por el texto del mensaje para
+  // poder avisar la causa real (en vez de un genérico "datos inválidos")
+  // sin repetir el texto interno de Resend tal cual.
   if (nombreError === "validation_error" && /testing email address|`to`/i.test(mensajeOriginal)) {
-    return "El destinatario no está permitido: sin un dominio verificado en Resend, solo se puede enviar al correo con el que te registraste en Resend (ver RESEND_FROM_EMAIL en .env.example).";
+    return "El destinatario no está permitido: se está enviando desde la dirección de prueba de Resend en vez del dominio propio verificado. Revisa que RESEND_FROM_EMAIL esté configurada correctamente (ver .env.example).";
   }
 
   switch (nombreError) {
