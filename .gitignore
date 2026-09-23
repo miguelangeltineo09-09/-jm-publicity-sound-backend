@@ -1,0 +1,31 @@
+# Dependencias
+node_modules/
+
+# Variables de entorno (contienen datos sensibles, nunca se versionan)
+.env
+.env.local
+.env.*.local
+
+# Salida de compilación de TypeScript
+dist/
+build/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.log
+
+# Archivos de sistema operativo
+.DS_Store
+Thumbs.db
+
+# Editores / IDEs
+.vscode/*
+!.vscode/extensions.json
+.idea/
+
+# Prisma (mantener el esquema, ignorar posibles archivos generados locales)
+generated/
+
+/src/generated/prisma

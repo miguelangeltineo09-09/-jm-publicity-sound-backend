@@ -1,0 +1,556 @@
+// ==========================================
+// Esquema de Prisma.
+// Aquí se define cómo Prisma genera su cliente, a qué base de datos se conecta
+// y el modelo de datos del negocio (catálogo de equipos, reservas y administración).
+// ==========================================
+
+// Generador del cliente de Prisma: crea el código TypeScript tipado
+// que se usará en /src/services (o /src/config) para consultar la base de datos.
+// El output se ubica dentro de /src para que quede junto al resto del código fuente.
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+// Fuente de datos: PostgreSQL, cuya cadena de conexión se lee desde
+// la variable de entorno DATABASE_URL (definida en prisma7.config.ts).
+datasource db {
+  provider = "postgresql"
+}
+
+// --- Modelos ---
+
+// Categoría del catálogo (ej. Bocinas, Micrófonos, Luces, Consolas).
+// Permite agrupar y filtrar los equipos en el frontend.
+model Categoria {
+  id     Int    @id @default(autoincrement())
+  // Nombre único para evitar categorías duplicadas (ej. dos veces "Luces").
+  nombre String @unique
+
+  createdAt DateTime @default(now())
+
+  // Un equipo pertenece a una única categoría; una categoría puede tener muchos equipos.
+  equipos Equipo[]
+}
+
+// Equipo de sonido/iluminación disponible para alquiler.
+model Equipo {
+  id Int @id @default(autoincrement())
+
+  nombre String
+
+  // Texto largo: descripción detallada del equipo para la ficha de producto.
+  descripcion String @db.Text
+
+  // Precio de alquiler. Decimal evita errores de redondeo propios de los
+  // números de punto flotante al trabajar con dinero.
+  precio Decimal @db.Decimal(10, 2)
+
+  // URL de la imagen alojada en Cloudinary; nullable porque un equipo puede
+  // crearse antes de subirle una foto.
+  imagenUrl String?
+
+  categoriaId Int
+  categoria   Categoria @relation(fields: [categoriaId], references: [id])
+
+  // Permite al admin "desactivar" un equipo (ocultarlo del catálogo público)
+  // sin perder su historial de reservas ni tener que borrarlo.
+  disponibleParaAlquiler Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Historial de reservas asociadas a este equipo — a través de
+  // ReservaEquipo (ver ese modelo, más abajo): antes Reserva tenía un
+  // "equipoId" directo (esta relación era "Reserva[]"), pero un evento
+  // puede incluir VARIOS equipos a la vez, así que hace falta la tabla
+  // intermedia clásica de muchos a muchos.
+  reservas ReservaEquipo[]
+
+  // Publicaciones de eventos realizados donde este equipo fue el protagonista.
+  publicaciones PublicacionEvento[]
+
+  // Reseñas de clientes sobre este equipo (ver modelo Resena más abajo).
+  resenas Resena[]
+
+  // Ítems que incluye el alquiler de este equipo (ver modelo ItemIncluido
+  // más abajo), ej. "4 monitores", "1 planta eléctrica".
+  itemsIncluidos ItemIncluido[]
+}
+
+// Un ítem incluido en el alquiler de un Equipo (ej. "4 monitores", "2 bajos
+// de 24", "1 cerebro", "1 planta eléctrica", "5 micrófonos").
+//
+// Es una tabla separada (relación uno a muchos) en vez de un solo campo de
+// texto libre en Equipo (ej. un párrafo con todo el listado) porque el
+// admin necesita poder agregar, editar o quitar ítems INDIVIDUALES sin
+// tocar el resto del texto, y mantener el orden en que prefiere que se
+// muestren (ver el campo "orden" abajo) — algo que un campo de texto suelto
+// no puede ofrecer de forma estructurada: habría que parsear/reescribir todo
+// el bloque a mano cada vez que cambia un solo ítem. Mismo criterio que
+// ImagenPublicacion (álbum de fotos con su propio orden) más arriba.
+model ItemIncluido {
+  id Int @id @default(autoincrement())
+
+  equipoId Int
+  // onDelete: Cascade — un ítem incluido no tiene sentido sin el equipo al
+  // que pertenece; si el equipo se borra del catálogo, sus ítems se van con él.
+  equipo Equipo @relation(fields: [equipoId], references: [id], onDelete: Cascade)
+
+  // Texto libre y corto describiendo el ítem (ej. "4 monitores").
+  descripcion String
+
+  // Posición en la que el admin quiere que se muestre este ítem dentro de
+  // la lista de su equipo (0 = primero). Se reordena con
+  // PATCH /api/equipos/:id/items-incluidos/orden (ej. al arrastrar y soltar
+  // en la interfaz de admin).
+  orden Int @default(0)
+}
+
+// Provincia/demarcación de República Dominicana. Se usa para cotizar el
+// costo de viaje según dónde sea el evento: el precio del Equipo NO
+// incluye viaje ni dieta (ver Reserva.provincia y factura.service.ts, que
+// suma este monto al precio del equipo para calcular el total a cobrar).
+//
+// La lista de provincias es FIJA (32 en total, cargadas por seed.ts): la
+// API solo permite editar "precioViaje" de una ya existente, nunca crear
+// ni eliminar provincias (ver provincia.controller.ts).
+model Provincia {
+  id Int @id @default(autoincrement())
+
+  nombre String @unique
+
+  // Costo de viaje hasta esta provincia. IMPORTANTE: este monto YA INCLUYE
+  // la dieta del personal — no son dos conceptos separados en el sistema,
+  // sino un solo precio por provincia que el admin edita desde el panel.
+  // Empieza en 0 (ver seed.ts) hasta que el admin lo configure.
+  precioViaje Decimal @default(0) @db.Decimal(10, 2)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Reservas de eventos que se realizan en esta provincia (ver
+  // Reserva.provinciaId más abajo).
+  reservas Reserva[]
+}
+
+// Estado del ciclo de vida de una reserva: empieza pendiente de revisión
+// por el admin, y termina confirmada o rechazada.
+enum EstadoReserva {
+  PENDIENTE
+  CONFIRMADA
+  RECHAZADA
+}
+
+// Solicitud de alquiler hecha por un cliente para uno o VARIOS equipos y
+// una fecha de evento.
+//
+// CAMBIO DE RELACIÓN (uno a uno -> muchos a muchos): antes este modelo
+// tenía un campo "equipoId" directo (una reserva = un solo equipo,
+// relación 1 a 1 con Equipo). En la práctica un cliente casi siempre
+// necesita VARIAS cosas para el mismo evento (ej. bocinas + luces +
+// consola), y hasta ahora eso obligaba a crear una solicitud separada
+// por cada equipo, sin ninguna garantía de que compartieran fecha/hora
+// (dos solicitudes independientes podían aprobarse con horarios que ni
+// siquiera coinciden). Ahora una sola Reserva representa UN evento
+// completo (una fecha, un horario) y puede incluir cualquier cantidad de
+// equipos a través de la tabla intermedia ReservaEquipo (ver ese modelo,
+// más abajo) — la relación pasa a ser muchos a muchos entre Reserva y
+// Equipo.
+model Reserva {
+  id Int @id @default(autoincrement())
+
+  // Datos del cliente. Se guardan como texto plano en la reserva (no se exige
+  // que el cliente tenga cuenta) para simplificar el flujo de alquiler.
+  clienteNombre    String
+  clienteTelefono  String
+  // Opcional a nivel de base de datos (vuelve a serlo tras haber sido
+  // obligatorio): es el medio para enviarle la factura por correo, pero
+  // el admin también puede crear una reserva manual (POST
+  // /api/reservas/admin) para un cliente que reservó en persona o por
+  // WhatsApp y del que todavía no se tiene el email. La obligatoriedad
+  // real sigue existiendo, pero se decidió a nivel de CONTROLADOR según
+  // el endpoint (ver reserva.controller.ts): el endpoint público
+  // (POST /api/reservas) sigue exigiéndolo; el de admin no. Si queda en
+  // null, no se puede enviar la factura de esta reserva por correo (ver
+  // email.service.ts), pero sí se puede seguir generando y descargando
+  // su PDF con normalidad.
+  clienteEmail     String?
+
+  // Hora en que arranca el evento/actividad y hora estimada en que termina
+  // (formato "HH:mm", ej. "18:00"). No son solo un dato informativo: el
+  // negocio los necesita para organizar la LOGÍSTICA de entrega y recogida
+  // del equipo (a qué hora hay que llevarlo, a qué hora hay que pasar por
+  // él), algo que la fecha del evento sola no dice.
+  horaInicio String
+  horaFin    String
+
+  // Los equipos de ESTE evento (uno o varios): ver ReservaEquipo. Ya NO
+  // hay un "equipoId"/"equipo" directo acá — toda la lógica que antes
+  // leía "reserva.equipo" (un solo objeto) ahora debe recorrer
+  // "reserva.equipos" (un array, uno por fila de ReservaEquipo) y, dentro
+  // de cada una, su ".equipo".
+  equipos ReservaEquipo[]
+
+  // Municipio puntual del evento dentro de la provincia (ej. "Boca Chica"
+  // dentro de Santo Domingo): junto con "provincia" abajo, es el dato de
+  // ubicación que usa la logística para saber a dónde hay que llevar el
+  // equipo. Texto libre (no hay un catálogo cerrado de municipios).
+  municipio String
+
+  provinciaId Int
+  // Sin onDelete: Cascade a propósito — la lista de provincias es fija
+  // (ver el modelo Provincia), nunca se borran, así que no hace falta
+  // decidir qué pasaría con sus reservas al eliminarla.
+  provincia Provincia @relation(fields: [provinciaId], references: [id])
+
+  // Fecha del evento para el que se solicitan los equipos (no la fecha de
+  // creación de la reserva). REGLA DE NEGOCIO: TODOS los equipos de esta
+  // reserva comparten esta misma fecha y el mismo horaInicio/horaFin de
+  // arriba — es un solo evento, no una fecha distinta por equipo.
+  fechaEvento DateTime
+
+  // Controla el flujo de aprobación: toda reserva nueva entra como PENDIENTE
+  // hasta que el admin la revisa.
+  estado EstadoReserva @default(PENDIENTE)
+
+  // Notas internas u observaciones del cliente/admin sobre la reserva.
+  notas String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Una reserva puede tener, como mucho, una factura (relación uno a uno).
+  // Opcional porque no toda reserva llega a facturarse (ver modelo Factura).
+  factura Factura?
+}
+
+// Tabla intermedia entre Reserva y Equipo (relación muchos a muchos: ver
+// el comentario largo en el modelo Reserva de arriba sobre por qué antes
+// era un "equipoId" directo y ahora es esta tabla). Cada fila es "este
+// equipo puntual está incluido en esta reserva puntual" — no lleva más
+// datos que eso (ni "cantidad" ni precio: el precio se congela recién al
+// facturar, ver ItemFactura más abajo).
+model ReservaEquipo {
+  id Int @id @default(autoincrement())
+
+  reservaId Int
+  // onDelete: Cascade — esta fila intermedia no tiene sentido sin la
+  // reserva a la que pertenece; se borra junto con ella (ej. al eliminar
+  // una reserva de prueba desde el panel).
+  reserva Reserva @relation(fields: [reservaId], references: [id], onDelete: Cascade)
+
+  equipoId Int
+  // onDelete: Cascade — mismo criterio que ItemIncluido/Resena sobre
+  // Equipo: si el equipo se borra del catálogo, no puede quedar una fila
+  // intermedia apuntando a un equipo que ya no existe. Esto es seguro
+  // porque equipo.controller.ts ya bloquea borrar un equipo que todavía
+  // tenga reservas PENDIENTE o CONFIRMADA (ahora consultando a través de
+  // esta misma tabla) — para cuando se llega a borrar, solo quedan filas
+  // de reservas RECHAZADA, que sí es correcto que se vayan con el equipo.
+  equipo Equipo @relation(fields: [equipoId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  // Un mismo equipo no puede repetirse dos veces DENTRO de la misma
+  // reserva (esta tabla no tiene "cantidad": pedir "2 de la misma
+  // bocina" no se modela duplicando la fila, sería ambiguo). Se valida
+  // también en reserva.controller.ts para devolver un mensaje de error
+  // claro en vez de dejar que llegue a chocar contra esta restricción.
+  @@unique([reservaId, equipoId])
+}
+
+// Factura emitida para una reserva ya resuelta (normalmente CONFIRMADA).
+//
+// Por qué "equipoNombre"/"precioUnitario" viven en ItemFactura (más
+// abajo) y no directo acá: antes una reserva era de UN solo equipo, así
+// que Factura tenía esos dos campos directo. Ahora que una reserva puede
+// tener varios equipos (ver ReservaEquipo), la factura necesita un
+// renglón POR EQUIPO — de ahí la relación uno (Factura) a muchos
+// (ItemFactura). Sigue siendo un SNAPSHOT (copiado tal como estaba el
+// equipo al momento de facturar, no una relación viva): si después el
+// admin le cambia el nombre o el precio al equipo (o hasta lo borra), la
+// factura ya emitida no debe cambiar retroactivamente ni quedar rota.
+model Factura {
+  id Int @id @default(autoincrement())
+
+  // Identificador legible para el cliente/contabilidad (ej. "FAC-0001"),
+  // distinto del id numérico interno.
+  numeroFactura String @unique
+
+  // Relación uno a uno: cada reserva se factura, como máximo, una vez
+  // (sin importar cuántos equipos tenga — sigue siendo UN evento, UNA
+  // factura, con un renglón por equipo adentro).
+  reservaId Int     @unique
+  reserva   Reserva @relation(fields: [reservaId], references: [id], onDelete: Cascade)
+
+  // Un renglón por cada equipo de la reserva (ver el modelo ItemFactura
+  // más abajo): reemplaza los antiguos campos directos
+  // "equipoNombre"/"precioUnitario" de esta tabla.
+  items ItemFactura[]
+
+  // Snapshot de Provincia.precioViaje al momento de facturar (mismo motivo
+  // que "precioUnitario" de cada ItemFactura: si el admin edita después
+  // el precioViaje de esa provincia, esta factura ya emitida no debe
+  // cambiar). Ya incluye la dieta — no es un campo separado, ver el
+  // comentario en el modelo Provincia. Sigue siendo UN solo cargo por
+  // EVENTO (no por equipo): venir con 3 equipos al mismo evento no
+  // triplica el costo de viaje, el camión hace un solo viaje.
+  precioViajeSnapshot Decimal @db.Decimal(10, 2)
+
+  // total = suma de "precioUnitario" de TODOS los ItemFactura de esta
+  // factura + precioViajeSnapshot (antes era solo "precioUnitario +
+  // precioViajeSnapshot", con un único equipo). Se guarda calculado (en
+  // vez de derivarlo al vuelo cada vez que se muestra) para que quede
+  // fijo en el momento de facturar, igual criterio que los snapshots de
+  // arriba — ver factura.service.ts para el cálculo real.
+  total Decimal @db.Decimal(10, 2)
+
+  fechaEmision DateTime @default(now())
+  createdAt    DateTime @default(now())
+}
+
+// Un renglón de una Factura: un equipo con su precio, ya congelado
+// (snapshot, ver el comentario del modelo Factura) al momento de
+// facturar. Antes esto vivía como dos campos directos en Factura
+// ("equipoNombre"/"precioUnitario"); ahora es su propia tabla porque una
+// factura puede necesitar varios renglones — uno por cada equipo de la
+// reserva (ver ReservaEquipo) — no solo uno.
+model ItemFactura {
+  id Int @id @default(autoincrement())
+
+  facturaId Int
+  // onDelete: Cascade — un renglón de factura no tiene sentido sin la
+  // factura a la que pertenece; se borra junto con ella.
+  factura Factura @relation(fields: [facturaId], references: [id], onDelete: Cascade)
+
+  equipoNombre   String
+  precioUnitario Decimal @db.Decimal(10, 2)
+
+  createdAt DateTime @default(now())
+}
+
+// Tipo de contenido multimedia de una publicación: un álbum de varias
+// fotos (carrusel), o un único video corto. Determina cuáles de los campos
+// de PublicacionEvento aplican (videoUrl vs. la relación con ImagenPublicacion).
+enum TipoPublicacion {
+  FOTO
+  VIDEO
+}
+
+// Publicación de un evento ya realizado ("red social" de trabajos del
+// negocio): un video o un álbum de fotos, asociado al equipo protagonista,
+// con un título y un comentario libre donde el admin puede mencionar
+// artistas, clientes, etc.
+model PublicacionEvento {
+  id Int @id @default(autoincrement())
+
+  // Título corto de la publicación (ej. "Boda en Jarabacoa", "Concierto con [artista]").
+  titulo String
+
+  // Descripción libre del evento (texto largo): aquí es donde el admin
+  // menciona artistas, clientes o cualquier detalle del evento. Opcional
+  // porque el título por sí solo puede alcanzar para publicaciones simples.
+  comentario String? @db.Text
+
+  // Determina si esta publicación es un álbum de fotos o un video (ver
+  // TipoPublicacion arriba).
+  tipo TipoPublicacion
+
+  // Solo tiene valor cuando tipo = VIDEO: URL del video alojado en
+  // Cloudinary. Nulo en publicaciones de tipo FOTO (esas usan la relación
+  // "imagenes" en su lugar).
+  videoUrl String?
+
+  // Miniatura/portada de la publicación. Aplica principalmente a VIDEO (a
+  // diferencia de un álbum de fotos, un video no tiene una "primera
+  // imagen" natural para mostrar como portada en un listado, así que se
+  // guarda aparte); queda disponible igual para FOTO por si en el futuro
+  // se quiere una portada distinta a la primera imagen del carrusel.
+  thumbnailUrl String?
+
+  equipoId Int
+  // onDelete: Cascade — si se borra el equipo protagonista del catálogo,
+  // no tiene sentido conservar publicaciones que ya no representan a
+  // ningún equipo real.
+  equipo Equipo @relation(fields: [equipoId], references: [id], onDelete: Cascade)
+
+  // Marca las publicaciones que aparecen en el adelanto del Home: una
+  // selección curada por el admin, no todas las publicaciones a la vez.
+  destacado Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Imágenes del álbum, solo presentes cuando tipo = FOTO (ver el
+  // comentario de ImagenPublicacion sobre por qué es una tabla separada).
+  imagenes ImagenPublicacion[]
+}
+
+// Una imagen del álbum de una PublicacionEvento de tipo FOTO.
+//
+// Es una tabla separada (relación uno a muchos) en vez de, por ejemplo, un
+// solo campo de texto con varias URLs en PublicacionEvento: una publicación
+// de tipo FOTO puede tener VARIAS imágenes (un carrusel de cualquier
+// tamaño), y cada una necesita mantener su propia posición dentro de ese
+// carrusel — algo que un modelo separado, con su propio campo "orden",
+// puede consultar y ordenar directamente con Prisma, a diferencia de
+// serializar un array a mano en un solo campo de texto.
+model ImagenPublicacion {
+  id Int @id @default(autoincrement())
+
+  publicacionId Int
+  // onDelete: Cascade — las imágenes de un álbum no tienen sentido sin la
+  // publicación a la que pertenecen: al borrar la publicación, se borran
+  // con ella (el archivo real en Cloudinary se borra aparte, ver
+  // publicacion.service.ts, ya que Cloudinary no sabe nada de esta base de datos).
+  publicacion PublicacionEvento @relation(fields: [publicacionId], references: [id], onDelete: Cascade)
+
+  imagenUrl String
+
+  // Posición dentro del carrusel (0 = primera imagen). Se define al subir
+  // las imágenes, en el mismo orden en que llegaron en la petición.
+  orden Int @default(0)
+}
+
+// Estado de moderación de una reseña. Toda reseña nace PENDIENTE: existe
+// este campo (en vez de mostrar cualquier reseña de inmediato) porque el
+// endpoint de creación es público y sin cuentas de usuario — sin
+// moderación, cualquiera podría publicar contenido ofensivo, spam o
+// calificaciones falsas directamente en el sitio, sin que nadie del
+// negocio lo revise antes. Solo las reseñas APROBADA se muestran
+// públicamente y cuentan para el promedio de calificación (ver
+// resena.service.ts); RECHAZADA se conserva en el registro (no se borra
+// sola) para que el admin pueda revisar su propio historial de moderación.
+enum EstadoResena {
+  PENDIENTE
+  APROBADA
+  RECHAZADA
+}
+
+// Reseña de un cliente sobre un Equipo (no sobre una publicación ni un
+// evento puntual): calificación de 1 a 5 estrellas más un comentario
+// libre opcional.
+model Resena {
+  id Int @id @default(autoincrement())
+
+  equipoId Int
+  // onDelete: Cascade — una reseña no tiene sentido sin el equipo al que
+  // califica; si el equipo se borra del catálogo, sus reseñas se van con él.
+  equipo Equipo @relation(fields: [equipoId], references: [id], onDelete: Cascade)
+
+  // Nombre de quien deja la reseña. Texto libre (no hay cuentas de
+  // cliente en este proyecto): se guarda tal como lo escribe, y también
+  // se usa para la validación anti-spam básica del POST público (ver
+  // resena.service.ts).
+  nombreCliente String
+
+  // Calificación de 1 a 5 estrellas. Int alcanza (la escala siempre es un
+  // número entero); el rango 1-5 se valida en el controlador, ya que
+  // Prisma no valida rangos numéricos por sí solo.
+  calificacion Int
+
+  // Comentario libre y opcional: no toda reseña necesita texto, una
+  // calificación sola ya es un dato útil.
+  comentario String? @db.Text
+
+  // Moderación (ver el comentario del enum EstadoResena arriba): controla
+  // si esta reseña ya es visible públicamente.
+  estado EstadoResena @default(PENDIENTE)
+
+  createdAt DateTime @default(now())
+}
+
+// Pregunta frecuente de la sección "Preguntas frecuentes" del sitio
+// público. El contenido inicial (ver prisma/seed.ts) son preguntas y
+// respuestas de EJEMPLO/PLACEHOLDER: el dueño del negocio debe editarlas
+// con sus respuestas reales desde el panel de admin — no hay nada más
+// que este modelo necesite reflejar sobre ese estado (no es un campo de
+// negocio, es responsabilidad operativa del admin).
+model PreguntaFrecuente {
+  id Int @id @default(autoincrement())
+
+  // La pregunta tal como se muestra al visitante (ej. "¿Con cuánta
+  // anticipación debo reservar?").
+  pregunta String
+
+  // Texto largo: la respuesta puede ser párrafos largos (ej. explicar una
+  // política de cancelación), no solo una frase corta.
+  respuesta String @db.Text
+
+  // Posición en la que el admin quiere que se muestre esta pregunta
+  // dentro de la lista pública (0 = primera). Mismo criterio que
+  // ItemIncluido.orden: se reordena con PATCH
+  // /api/preguntas-frecuentes/orden (ej. al arrastrar y soltar en el panel).
+  orden Int @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Configuración de contacto del sitio: teléfono, email, horario de
+// atención y mensaje de cobertura, editables desde el panel de admin sin
+// tocar código.
+//
+// SINGLETON: esta tabla debe tener SIEMPRE EXACTAMENTE UNA fila (la que
+// crea prisma/seed.ts). No existe un POST en la API (ver
+// configuracionContacto.controller.ts) — solo GET (público) y PUT
+// (admin) sobre esa única fila ya existente. Es el mismo patrón que
+// usaría un archivo de configuración (una sola instancia de valores
+// globales), pero guardado en la base de datos para que el admin pueda
+// editarlo desde el panel en vez de tocar código/variables de entorno.
+model ConfiguracionContacto {
+  id Int @id @default(autoincrement())
+
+  // Valor inicial "8296450922" (ver prisma/seed.ts).
+  telefono String
+
+  // Opcional: todavía no hay un dominio propio para un email de negocio
+  // (ver el comentario sobre REMITENTE en email.service.ts) — queda vacío
+  // hasta que el admin lo complete desde el panel cuando lo tengan.
+  email String?
+
+  // Valor inicial "Lunes a Domingo, 9:00 AM - 6:00 PM". Texto libre (no
+  // una estructura de días/horas): más simple de editar desde un solo
+  // campo de texto en el panel, y el dato es puramente informativo para
+  // el visitante, no algo que el sistema necesite interpretar/calcular.
+  horarioAtencion String
+
+  // Valor inicial "Trabajamos a domicilio en toda República Dominicana".
+  mensajeCobertura String
+
+  updatedAt DateTime @updatedAt
+}
+
+// Red social del negocio (ej. Instagram, Facebook, TikTok), mostrada en
+// el sitio público (footer/contacto). A diferencia de Provincia (lista
+// FIJA, sin crear/eliminar), acá el admin puede agregar y quitar redes
+// libremente según cuáles use el negocio en cada momento.
+model RedSocial {
+  id Int @id @default(autoincrement())
+
+  // Nombre visible de la red (ej. "Instagram", "Facebook", "TikTok").
+  nombre String
+
+  // Enlace completo al perfil del negocio en esa red.
+  url String
+
+  // Posición en la que se muestra (0 = primera). Mismo criterio que
+  // ItemIncluido.orden / PreguntaFrecuente.orden: se reordena con PATCH
+  // /api/redes-sociales/orden.
+  orden Int @default(0)
+
+  createdAt DateTime @default(now())
+}
+
+// Usuario administrador: único tipo de usuario con acceso al panel de gestión.
+model Admin {
+  id Int @id @default(autoincrement())
+
+  email String @unique
+
+  // Nunca se guarda la contraseña en texto plano: solo su hash (bcrypt).
+  passwordHash String
+
+  createdAt DateTime @default(now())
+}
