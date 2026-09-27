@@ -1,12 +1,13 @@
 // ==========================================
 // Rutas de Equipos.
 // GET son públicas (catálogo); el resto requiere admin autenticado.
-// POST/PUT usan multer para aceptar multipart/form-data (datos + imagen).
+// POST/PUT usan multer para aceptar multipart/form-data (datos + el archivo
+// del medio principal del equipo: una imagen o un video).
 // ==========================================
 
 import { Router } from "express";
 import { authMiddleware } from "../middlewares/auth.middleware";
-import { upload } from "../config/multer";
+import { recibirMediaEquipo } from "../config/multer";
 import {
   actualizarEquipo,
   cambiarDisponibilidad,
@@ -39,9 +40,11 @@ router.get("/:id", obtenerEquipo);
 router.get("/:id/resenas", listarResenasDeEquipo);
 router.get("/:id/items-incluidos", listarItemsIncluidos);
 
-// "imagen" es el nombre del campo de archivo esperado en el form-data.
-router.post("/", authMiddleware, upload.single("imagen"), crearEquipo);
-router.put("/:id", authMiddleware, upload.single("imagen"), actualizarEquipo);
+// "recibirMediaEquipo" acepta un archivo en el campo "imagen" (equipo de tipo
+// FOTO) o en el campo "video" (equipo de tipo VIDEO); cuál corresponde y que
+// llegue exactamente uno se valida en equipo.service.ts, según el "tipoMedia".
+router.post("/", authMiddleware, recibirMediaEquipo, crearEquipo);
+router.put("/:id", authMiddleware, recibirMediaEquipo, actualizarEquipo);
 router.post("/:id/items-incluidos", authMiddleware, crearItemIncluido);
 
 router.delete("/:id", authMiddleware, eliminarEquipo);

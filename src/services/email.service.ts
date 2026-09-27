@@ -2,18 +2,24 @@
 // Servicio de envío de correo.
 // Envía la factura en PDF al cliente de una reserva, usando Resend. No
 // duplica lógica ya existente: reutiliza generarPDFFactura() (el PDF) y los
-// errores/formateo ya definidos en factura.service.ts.
+// errores/formateo ya definidos en factura.service.ts, y lee los datos de
+// contacto del negocio con obtenerContactoNegocio() de
+// configuracionContacto.service.ts (la misma lectura que usa ese PDF).
 // ==========================================
 
 import { resend } from "../config/resend";
 import { prisma } from "../config/prisma";
+import { obtenerContactoNegocio } from "./configuracionContacto.service";
+import type { ContactoNegocio } from "./configuracionContacto.service";
 import { FacturaNoEncontradaError, formatearFechaUTC, generarPDFFactura } from "./factura.service";
 
-// Mismos datos de contacto genéricos usados en el PDF de la factura
-// (ver factura.service.ts) y en el footer del sitio público, para que el
-// correo se vea consistente con el resto de las comunicaciones del negocio.
-const TELEFONO_NEGOCIO = "+52 55 0000 0000";
-const EMAIL_NEGOCIO = "contacto@jmpublicitysound.com";
+// El teléfono y el email de contacto que se muestran al final del correo YA
+// NO están escritos acá: antes eran datos de relleno ("+52 55 0000 0000",
+// "contacto@jmpublicitysound.com") que no correspondían al negocio real.
+// Ahora se leen de la tabla ConfiguracionContacto cada vez que se arma un
+// correo (ver obtenerContactoNegocio), la misma fuente que usa el encabezado
+// del PDF adjunto, así que el cuerpo del mensaje y el comprobante muestran
+// el mismo contacto.
 
 // Remitente del correo. El dominio jmpublicitysound.com YA está verificado
 // en Resend (Settings > Domains), así que las facturas se envían desde una
@@ -95,6 +101,64 @@ function mensajeDeErrorResend(errorResend: { name: string; message: string }): s
   }
 }
 
+// Escapa los caracteres con significado especial en HTML ("&", "<", ">" y las
+// comillas) para que un valor se muestre siempre como TEXTO y nunca se
+// interprete como HTML. Se aplica a TODO valor que se inserta como texto en
+// el HTML del correo (ver construirHtmlCorreo y construirBloqueContacto).
+//
+// Es necesario porque este correo sale desde el dominio REAL del negocio
+// (ver REMITENTE), así que el cliente lo recibe como un mensaje legítimo de
+// JM Publicity Sound, y varios de sus datos son texto libre que nadie
+// revisa antes:
+//   - "clienteNombre" lo escribe el propio cliente en el formulario PÚBLICO
+//     de reservas, que solo exige que no esté vacío (ver
+//     reserva.controller.ts). Sin escapar, alguien que reserve con el nombre
+//     <a href="https://sitio-malo.example">Confirma tu pago aquí</a> haría
+//     que el correo, enviado con la credibilidad del dominio real, mostrara
+//     un enlace armado por él (phishing); y con solo escribir un "<" o unas
+//     etiquetas de cierre rompería el diseño del correo.
+//   - Los nombres de los equipos y los datos de contacto también son texto
+//     libre guardado en la base de datos (los carga el admin).
+//
+// El "&" se reemplaza primero para no volver a escapar los "&" que agregan
+// los demás reemplazos.
+function escaparHtml(texto: string): string {
+  return texto
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+// Bloque "si tienes dudas, contáctanos" del cuerpo del correo, armado con los
+// datos de contacto reales del negocio. Cada dato se muestra solo si tiene
+// valor (ver ContactoNegocio): si el email no está configurado (null), NO se
+// dibuja ninguna línea "Email:" — ni vacía ni con el texto literal "null" —
+// y queda solo el teléfono. Si no hay NINGÚN dato, se omite el bloque
+// completo (incluida la frase "puedes contactarnos:") para no dejar una
+// invitación a contactar sin ninguna forma de hacerlo.
+function construirBloqueContacto(contacto: ContactoNegocio): string {
+  const lineas: string[] = [];
+
+  if (contacto.telefono) {
+    lineas.push(`Tel: ${escaparHtml(contacto.telefono)}`);
+  }
+  if (contacto.email) {
+    lineas.push(`Email: ${escaparHtml(contacto.email)}`);
+  }
+
+  if (lineas.length === 0) {
+    return "";
+  }
+
+  return `
+      <p>Si tienes cualquier duda sobre tu factura o tu reserva, puedes contactarnos:</p>
+      <p>
+        ${lineas.join("<br />\n        ")}
+      </p>`;
+}
+
 // Cuerpo HTML del correo: saludo, contexto de la reserva (qué se
 // facturó y para cuándo), aviso del adjunto, y datos de contacto para
 // dudas. Se mantiene simple e inline (sin CSS externo) porque los clientes
@@ -104,28 +168,40 @@ function construirHtmlCorreo(params: {
   numeroFactura: string;
   equiposNombres: string[];
   fechaEvento: Date;
+  contacto: ContactoNegocio;
 }): string {
-  const { clienteNombre, numeroFactura, equiposNombres, fechaEvento } = params;
+  const { clienteNombre, numeroFactura, equiposNombres, fechaEvento, contacto } = params;
+
+  // REGLA de esta función: todo valor que se inserta como TEXTO en el HTML
+  // pasa por escaparHtml (ver por qué en ese comentario). El más delicado es
+  // "clienteNombre", que escribe el cliente en el formulario público; los
+  // demás (equipos, número de factura y fecha) se escapan igual, aunque hoy
+  // los genere el propio servidor o el admin, para que la regla no tenga
+  // excepciones que recordar si algún día cambia de dónde sale un dato.
+  const nombreCliente = escaparHtml(clienteNombre);
+
   // Antes una reserva/factura tenía un solo equipo; ahora puede tener
   // varios (ver ItemFactura en prisma/schema.prisma), así que se listan
-  // todos los nombres separados por coma en el cuerpo del correo.
-  const nombresEquipos = equiposNombres.join(", ");
+  // todos los nombres separados por coma en el cuerpo del correo. Cada
+  // nombre se escapa por separado ANTES de unirlos.
+  const nombresEquipos = equiposNombres.map(escaparHtml).join(", ");
+
+  // Bloque de contacto ya armado (o cadena vacía si no hay ningún dato). Es
+  // el único valor que se inserta SIN volver a escapar: ya es HTML propio de
+  // la plantilla (párrafos y saltos de línea) y sus datos ya salen escapados
+  // de construirBloqueContacto; escaparlo de nuevo mostraría las etiquetas.
+  const bloqueContacto = construirBloqueContacto(contacto);
 
   return `
     <div style="font-family: Arial, sans-serif; color: #222; max-width: 480px; margin: 0 auto;">
       <h2 style="color: #0891b2;">JM Publicity Sound</h2>
-      <p>Hola ${clienteNombre},</p>
+      <p>Hola ${nombreCliente},</p>
       <p>
-        Adjuntamos la factura <strong>${numeroFactura}</strong> correspondiente a la
+        Adjuntamos la factura <strong>${escaparHtml(numeroFactura)}</strong> correspondiente a la
         reserva de <strong>${nombresEquipos}</strong> para el evento del
-        <strong>${formatearFechaUTC(fechaEvento)}</strong>.
+        <strong>${escaparHtml(formatearFechaUTC(fechaEvento))}</strong>.
       </p>
-      <p>El comprobante está adjunto a este correo en formato PDF.</p>
-      <p>Si tienes cualquier duda sobre tu factura o tu reserva, puedes contactarnos:</p>
-      <p>
-        Tel: ${TELEFONO_NEGOCIO}<br />
-        Email: ${EMAIL_NEGOCIO}
-      </p>
+      <p>El comprobante está adjunto a este correo en formato PDF.</p>${bloqueContacto}
       <p style="color: #888; font-size: 12px;">JM Publicity Sound — Alquiler de equipos de sonido para eventos.</p>
     </div>
   `;
@@ -140,8 +216,11 @@ function construirHtmlCorreo(params: {
  *    el nombre del equipo y la fecha del evento del cuerpo del correo).
  * 2. Generar el PDF reutilizando generarPDFFactura() — no se rearma el
  *    documento acá, se llama a la función ya existente.
- * 3. Enviar el correo con Resend, con el PDF como adjunto.
- * 4. Traducir cualquier error de Resend a un mensaje claro (ver
+ * 3. Leer los datos de contacto reales del negocio (ConfiguracionContacto)
+ *    para el pie del cuerpo del correo; el dato que no esté configurado se
+ *    omite en vez de mostrarse vacío (ver construirBloqueContacto).
+ * 4. Enviar el correo con Resend, con el PDF como adjunto.
+ * 5. Traducir cualquier error de Resend a un mensaje claro (ver
  *    mensajeDeErrorResend), sin dejar pasar detalles internos.
  */
 export async function enviarFacturaPorCorreo(facturaId: number): Promise<{ enviadoA: string }> {
@@ -172,6 +251,12 @@ export async function enviarFacturaPorCorreo(facturaId: number): Promise<{ envia
   // la propiedad del objeto en vez de esta constante ya angosta.
   const pdf = await generarPDFFactura(facturaId);
 
+  // Datos de contacto REALES del negocio para el pie del correo (ver
+  // construirBloqueContacto). Se leen acá, ya con el PDF generado, y se le
+  // pasan ya resueltos al armado del HTML para que esa función siga siendo
+  // pura (sin acceder a la base de datos), igual que construirPDF.
+  const contacto = await obtenerContactoNegocio();
+
   const { clienteNombre } = factura.reserva;
   const nombreArchivo = `factura-${factura.numeroFactura}.pdf`;
 
@@ -186,6 +271,7 @@ export async function enviarFacturaPorCorreo(facturaId: number): Promise<{ envia
         numeroFactura: factura.numeroFactura,
         equiposNombres: factura.items.map((item) => item.equipoNombre),
         fechaEvento: factura.reserva.fechaEvento,
+        contacto,
       }),
       attachments: [{ filename: nombreArchivo, content: pdf }],
     });

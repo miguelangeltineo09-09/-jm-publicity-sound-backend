@@ -1,7 +1,7 @@
 // ==========================================
 // Configuración de Cloudinary.
 // Inicializa el SDK con las credenciales de la cuenta (leídas de .env) para
-// que src/services/upload.service.ts pueda subir imágenes de equipos.
+// que src/services/upload.service.ts pueda subir imágenes y videos de equipos.
 // ==========================================
 
 import { v2 as cloudinary } from "cloudinary";

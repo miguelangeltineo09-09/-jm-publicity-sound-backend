@@ -1,7 +1,9 @@
 // ==========================================
 // Controlador de Equipos.
-// Traduce las peticiones HTTP de /api/equipos a operaciones sobre Prisma,
-// incluyendo la subida de imágenes a Cloudinary cuando corresponde.
+// Traduce las peticiones HTTP de /api/equipos a operaciones sobre Prisma
+// (listar, detalle, borrar, cambiar disponibilidad) o a llamadas a
+// equipo.service.ts (crear y editar, que involucran el archivo del medio
+// principal del equipo —una imagen o un video— y su subida a Cloudinary).
 // La lectura (listar/detalle) es pública; crear/editar/eliminar/cambiar
 // disponibilidad requieren admin autenticado (ver equipo.routes.ts).
 // ==========================================
@@ -9,9 +11,15 @@
 import type { Request, Response } from "express";
 import { prisma } from "../config/prisma";
 import { Prisma } from "../generated/prisma/client";
-import type { EquipoUpdateInput, EquipoWhereInput } from "../generated/prisma/models";
-import { EstadoReserva } from "../generated/prisma/enums";
-import { subirImagen } from "../services/upload.service";
+import type { EquipoWhereInput } from "../generated/prisma/models";
+import { EstadoReserva, TipoMedia } from "../generated/prisma/enums";
+import {
+  EquipoNoEncontradoError,
+  MediaInvalidoError,
+  actualizarEquipo as actualizarEquipoService,
+  crearEquipo as crearEquipoService,
+} from "../services/equipo.service";
+import type { ArchivosMedia } from "../services/equipo.service";
 
 // Reservas en estos estados siguen "activas": bloquean el borrado del equipo
 // porque hay un compromiso pendiente o confirmado con un cliente.
@@ -81,9 +89,13 @@ export async function obtenerEquipo(req: Request, res: Response): Promise<void> 
 interface DatosEquipoValidados {
   nombre?: string;
   descripcion?: string;
-  precio?: Prisma.Decimal | number;
+  // Texto libre (ya no un número): ver el comentario de la validación de
+  // "precio" en validarDatosEquipo.
+  precio?: string;
   categoriaId?: number;
   disponibleParaAlquiler?: boolean;
+  // Medio principal del equipo (ver el enum TipoMedia en prisma/schema.prisma).
+  tipoMedia?: TipoMedia;
 }
 
 async function validarDatosEquipo(
@@ -109,12 +121,27 @@ async function validarDatosEquipo(
   }
 
   // --- precio ---
+  // Acepta cualquier texto no vacío (ya NO se exige que sea un número
+  // positivo): puede contener un número escrito como texto (ej. "45000") o
+  // una frase (ej. "Negociable en privado", "Precio a consultar"), para los
+  // equipos cuyo monto se acuerda con el cliente. Se guarda tal cual (solo
+  // se recortan los espacios de los extremos): interpretarlo como número es
+  // trabajo de parsearPrecioNumerico() (src/utils/precio.ts), justo en el
+  // momento en que el sistema necesita calcular con él.
   if (body.precio !== undefined || !parcial) {
-    const precioNumerico = Number(body.precio);
-    if (typeof body.precio === "undefined" || Number.isNaN(precioNumerico) || precioNumerico <= 0) {
-      return { error: "El campo 'precio' es obligatorio y debe ser un número mayor a 0." };
+    // Un cliente que mande JSON (en vez de multipart/form-data) puede enviar
+    // el precio como número (ej. 45000): se convierte a texto para no
+    // rechazar lo que antes sí se aceptaba.
+    const precioTexto =
+      typeof body.precio === "number" && Number.isFinite(body.precio) ? String(body.precio) : body.precio;
+
+    if (typeof precioTexto !== "string" || !precioTexto.trim()) {
+      return {
+        error:
+          "El campo 'precio' es obligatorio y debe ser un texto no vacío (ej. \"45000\" o \"Negociable en privado\").",
+      };
     }
-    datos.precio = precioNumerico;
+    datos.precio = precioTexto.trim();
   }
 
   // --- categoriaId ---
@@ -146,14 +173,40 @@ async function validarDatosEquipo(
     }
   }
 
+  // --- tipoMedia (opcional) ---
+  // "FOTO" o "VIDEO". Si no se manda: al CREAR el equipo queda como FOTO, y
+  // al EDITAR conserva el tipo que ya tenía. Cambiarlo al editar exige
+  // además enviar el archivo del tipo nuevo (ver equipo.service.ts).
+  if (body.tipoMedia !== undefined) {
+    if (body.tipoMedia !== TipoMedia.FOTO && body.tipoMedia !== TipoMedia.VIDEO) {
+      return { error: "El campo 'tipoMedia' debe ser 'FOTO' o 'VIDEO'." };
+    }
+    datos.tipoMedia = body.tipoMedia;
+  }
+
   return { datos };
+}
+
+// Saca de la petición los archivos del medio (imagen y/o video) como buffers
+// en memoria. Con multer configurado vía ".fields([...])" (ver
+// recibirMediaEquipo en src/config/multer.ts), "req.files" llega como un
+// objeto agrupado por nombre de campo; si la petición no era multipart (ej.
+// un JSON sin archivos), llega sin definir y no hay ningún archivo.
+function leerArchivosMedia(req: Request): ArchivosMedia {
+  const archivos = req.files as { imagen?: Express.Multer.File[]; video?: Express.Multer.File[] } | undefined;
+  return { imagen: archivos?.imagen?.[0]?.buffer, video: archivos?.video?.[0]?.buffer };
 }
 
 /**
  * POST /api/equipos
- * Crea un equipo nuevo. Espera multipart/form-data: los campos del equipo
- * más, opcionalmente, un archivo "imagen" (ver multer en equipo.routes.ts).
- * Si viene imagen, se sube primero a Cloudinary y su URL se guarda en imagenUrl.
+ * Crea un equipo nuevo. Espera multipart/form-data: los campos del equipo,
+ * "tipoMedia" ("FOTO" por defecto, o "VIDEO") y el archivo de su medio
+ * principal (ver multer en equipo.routes.ts):
+ * - tipoMedia="FOTO": una imagen en el campo "imagen".
+ * - tipoMedia="VIDEO": un video en el campo "video".
+ * Es obligatorio enviar exactamente UNO de los dos, el que corresponda al
+ * tipo. El archivo se sube a Cloudinary y su URL se guarda en imagenUrl
+ * (FOTO) o en videoUrl y thumbnailUrl (VIDEO); ver equipo.service.ts.
  */
 export async function crearEquipo(req: Request, res: Response): Promise<void> {
   const resultado = await validarDatosEquipo(req.body, { parcial: false });
@@ -163,32 +216,39 @@ export async function crearEquipo(req: Request, res: Response): Promise<void> {
     return;
   }
 
-  const { nombre, descripcion, precio, categoriaId, disponibleParaAlquiler } = resultado.datos;
+  const { nombre, descripcion, precio, categoriaId, disponibleParaAlquiler, tipoMedia } = resultado.datos;
 
-  // La imagen es opcional al crear: un equipo puede darse de alta sin foto todavía.
-  const imagenUrl = req.file ? await subirImagen(req.file.buffer) : null;
-
-  const equipo = await prisma.equipo.create({
-    data: {
-      nombre: nombre!,
-      descripcion: descripcion!,
-      precio: precio!,
-      categoriaId: categoriaId!,
-      disponibleParaAlquiler: disponibleParaAlquiler ?? true,
-      imagenUrl,
-    },
-    include: { categoria: true },
-  });
-
-  res.status(201).json(equipo);
+  try {
+    const equipo = await crearEquipoService(
+      {
+        nombre: nombre!,
+        descripcion: descripcion!,
+        precio: precio!,
+        categoriaId: categoriaId!,
+        disponibleParaAlquiler,
+        tipoMedia,
+      },
+      leerArchivosMedia(req)
+    );
+    res.status(201).json(equipo);
+  } catch (error) {
+    if (error instanceof MediaInvalidoError) {
+      res.status(400).json({ error: error.message });
+      return;
+    }
+    throw error;
+  }
 }
 
 /**
  * PUT /api/equipos/:id
  * Edita un equipo existente. Solo valida/actualiza los campos que llegaron
- * en el body (actualización parcial). Si llega un archivo nuevo, se sube a
- * Cloudinary y reemplaza la imagenUrl anterior (la imagen vieja no se borra
- * de Cloudinary: eso queda fuera del alcance de esta fase).
+ * en el body (actualización parcial). El medio principal se puede reemplazar
+ * enviando un archivo nuevo (imagen o video, según el tipo del equipo), y se
+ * puede cambiar el equipo de FOTO a VIDEO (o al revés) enviando "tipoMedia"
+ * junto con el archivo del tipo nuevo. El medio anterior se borra de
+ * Cloudinary y sus campos quedan en null; las reglas completas están en
+ * actualizarEquipo de equipo.service.ts.
  */
 export async function actualizarEquipo(req: Request, res: Response): Promise<void> {
   const id = Number(req.params.id);
@@ -205,22 +265,16 @@ export async function actualizarEquipo(req: Request, res: Response): Promise<voi
     return;
   }
 
-  const datosActualizados: EquipoUpdateInput = { ...resultado.datos };
-
-  if (req.file) {
-    datosActualizados.imagenUrl = await subirImagen(req.file.buffer);
-  }
-
   try {
-    const equipo = await prisma.equipo.update({
-      where: { id },
-      data: datosActualizados,
-      include: { categoria: true },
-    });
+    const equipo = await actualizarEquipoService(id, resultado.datos, leerArchivosMedia(req));
     res.status(200).json(equipo);
   } catch (error) {
-    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2025") {
+    if (error instanceof EquipoNoEncontradoError) {
       res.status(404).json({ error: "Equipo no encontrado." });
+      return;
+    }
+    if (error instanceof MediaInvalidoError) {
+      res.status(400).json({ error: error.message });
       return;
     }
     throw error;

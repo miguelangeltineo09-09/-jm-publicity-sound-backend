@@ -33,6 +33,21 @@ model Categoria {
   equipos Equipo[]
 }
 
+// Tipo de medio principal de un Equipo: una FOTO o un VIDEO. Existe porque
+// hay equipos de los que el dueño solo tiene un video (no una foto), y hasta
+// ahora la ficha de un equipo solo podía mostrar una imagen. Determina cuáles
+// de los campos de medio del Equipo aplican (imagenUrl, o bien videoUrl y
+// thumbnailUrl).
+//
+// Es un enum propio (no se reutiliza TipoPublicacion, el de las publicaciones
+// de eventos) porque es un concepto independiente: que hoy ambos tengan los
+// mismos dos valores es una coincidencia, no un vínculo — cambiar uno no debe
+// afectar al otro.
+enum TipoMedia {
+  FOTO
+  VIDEO
+}
+
 // Equipo de sonido/iluminación disponible para alquiler.
 model Equipo {
   id Int @id @default(autoincrement())
@@ -42,13 +57,45 @@ model Equipo {
   // Texto largo: descripción detallada del equipo para la ficha de producto.
   descripcion String @db.Text
 
-  // Precio de alquiler. Decimal evita errores de redondeo propios de los
-  // números de punto flotante al trabajar con dinero.
-  precio Decimal @db.Decimal(10, 2)
+  // Precio de alquiler, guardado como TEXTO LIBRE (antes era Decimal(10,2),
+  // que obligaba a escribir siempre un número). Puede contener:
+  //  - un número escrito como texto (ej. "45000" o "1500.50"): el sistema sí
+  //    puede usarlo para calcular y facturar automáticamente; o
+  //  - una frase (ej. "Negociable en privado", "Precio a consultar"): para
+  //    equipos cuyo monto se acuerda con el cliente caso por caso.
+  // Como ya no hay garantía de que sea un número, NUNCA se debe hacer
+  // Number(equipo.precio) directo para calcular con él: hay que usar siempre
+  // parsearPrecioNumerico() (ver src/utils/precio.ts), que devuelve null si
+  // el texto no es un monto válido. El monto que finalmente se cobra queda
+  // congelado como número en ItemFactura.precioUnitario al facturar.
+  precio String
 
-  // URL de la imagen alojada en Cloudinary; nullable porque un equipo puede
-  // crearse antes de subirle una foto.
+  // Medio principal del equipo: FOTO o VIDEO (ver el enum TipoMedia arriba).
+  // Por defecto FOTO: así todos los equipos que ya existían (que solo tienen
+  // imagenUrl) quedan como FOTO sin tocar ningún dato, conservando su imagen.
+  // Los tres campos siguientes (imagenUrl, videoUrl, thumbnailUrl) son
+  // opcionales precisamente porque cuáles tienen valor depende de este campo.
+  tipoMedia TipoMedia @default(FOTO)
+
+  // URL de la imagen alojada en Cloudinary. Solo se usa cuando tipoMedia =
+  // FOTO; queda nula cuando tipoMedia = VIDEO (el equipo usa videoUrl).
+  // Opcional también con FOTO: un equipo puede no tener foto todavía (la API
+  // exige el archivo al CREAR un equipo, pero los que se crearon antes de esa
+  // regla pueden no tener imagen).
   imagenUrl String?
+
+  // URL del video alojado en Cloudinary. Solo se usa cuando tipoMedia =
+  // VIDEO; nula cuando tipoMedia = FOTO (el equipo usa imagenUrl).
+  videoUrl String?
+
+  // Miniatura/portada del video: una imagen fija derivada del propio video
+  // (Cloudinary sirve un fotograma del video como imagen, ver
+  // upload.service.ts). Sirve para los casos donde hace falta una imagen y no
+  // se puede reproducir un video (ej. la vista previa al compartir el enlace
+  // en redes sociales, o el "poster" del reproductor mientras carga). Solo se
+  // llena cuando tipoMedia = VIDEO; con FOTO queda nula (la propia imagenUrl
+  // ya es la imagen fija).
+  thumbnailUrl String?
 
   categoriaId Int
   categoria   Categoria @relation(fields: [categoriaId], references: [id])
@@ -324,7 +371,12 @@ model ItemFactura {
   // factura a la que pertenece; se borra junto con ella.
   factura Factura @relation(fields: [facturaId], references: [id], onDelete: Cascade)
 
-  equipoNombre   String
+  equipoNombre String
+  // Siempre un NÚMERO (Decimal), aunque Equipo.precio sea texto: si el
+  // precio del equipo era numérico ("45000"), aquí se copia ese valor; si
+  // era una frase (ej. "Negociable en privado"), aquí queda el monto que el
+  // admin indicó a mano al facturar (ver "preciosManuales" en
+  // factura.service.ts). Así los totales siempre se pueden sumar.
   precioUnitario Decimal @db.Decimal(10, 2)
 
   createdAt DateTime @default(now())
